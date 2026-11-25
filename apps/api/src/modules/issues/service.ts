@@ -17,13 +17,11 @@ import {
   initiative,
   cycle,
   team,
-  issueLink,
   MAX_SUBTASK_DEPTH,
   lockIssueTree,
   parentLinkProblem,
   type DbExecutor,
 } from '@repo/db';
-import { alias } from 'drizzle-orm/pg-core';
 import {
   and,
   eq,
@@ -89,6 +87,13 @@ import { runOrigin } from '#modules/agents/core/run-initiator';
 import { deleteThreadsWhere } from '#modules/agents/core/runtime/memory';
 import { queueStatusRuns } from '#modules/agents/schedules/issue-runs';
 import { applySubtaskAutomation } from './automation';
+import {
+  blockedColumnId,
+  blockedReasonRequired,
+  blockedTargetIds,
+  openBlockerOf,
+  syncBlockedIssues,
+} from './blocked';
 import { assertWipLimit, columnAutoAssignee, wipLimitBreach } from '#modules/columns/service';
 
 // Data access for issues and their per-issue data: labels, custom field values,
@@ -139,6 +144,10 @@ export interface IssueRow {
   startDate: string | null;
   dueDate: string | null;
   position: number;
+  // Set while the issue is in the blocked column: the reason a person gave, or null
+  // when its blocking issues hold it there, and the column it returns to.
+  blockedReason: string | null;
+  blockedFromColumnId: number | null;
   createdAt: string;
   updatedAt: string;
   // When the issue was archived (hidden from the board but kept), or null when it
@@ -190,6 +199,8 @@ function mapIssue(row: typeof issue.$inferSelect, projectKey: string): IssueRow 
     startDate: row.startDate,
     dueDate: row.dueDate,
     position: num(row.position),
+    blockedReason: row.blockedReason,
+    blockedFromColumnId: row.blockedFromColumnId,
     createdAt: iso(row.createdAt),
     updatedAt: iso(row.updatedAt),
     archivedAt: row.archivedAt ? iso(row.archivedAt) : null,
@@ -569,27 +580,7 @@ export async function searchIssues(
     );
   }
 
-  if (filters.blocked) {
-    const blocker = alias(issue, 'blocker');
-    const blockerColumn = alias(projectColumn, 'blocker_column');
-    conds.push(
-      exists(
-        db
-          .select({ one: sql`1` })
-          .from(issueLink)
-          .innerJoin(blocker, eq(blocker.id, issueLink.sourceIssueId))
-          .innerJoin(blockerColumn, eq(blockerColumn.id, blocker.columnId))
-          .where(
-            and(
-              eq(issueLink.targetIssueId, issue.id),
-              eq(issueLink.kind, 'blocks'),
-              isNull(blocker.archivedAt),
-              notInArray(blockerColumn.stateType, ['completed', 'canceled']),
-            ),
-          ),
-      ),
-    );
-  }
+  if (filters.blocked) conds.push(openBlockerOf(issue.id));
 
   const base = db
     .select(hitColumns)
@@ -750,6 +741,7 @@ export async function archiveIssue(
   await recordActivity(id, [{ action: 'archived' }], actorUserId);
   const archived = await getIssue(id);
   if (archived) await emitIssueEvent('issue.updated', archived, actorUserId);
+  await syncBlockedIssues(await blockedTargetIds([id]), actorUserId);
   return archived;
 }
 
@@ -768,6 +760,7 @@ export async function restoreIssue(
   await recordActivity(id, [{ action: 'restored' }], actorUserId);
   const restored = await getIssue(id);
   if (restored) await emitIssueEvent('issue.updated', restored, actorUserId);
+  await syncBlockedIssues(await blockedTargetIds([id]), actorUserId);
   return restored;
 }
 
@@ -1033,6 +1026,7 @@ export interface NewIssueInput {
   estimateMinutes?: number | null;
   startDate?: string | null;
   dueDate?: string | null;
+  blockedReason?: string;
   labelIds?: number[];
 }
 
@@ -1173,7 +1167,7 @@ export async function createIssue(
   project: ProjectRow,
   input: NewIssueInput,
   actorUserId?: string | null,
-  opts?: { skipUnavailableAssignee?: boolean },
+  opts?: { skipUnavailableAssignee?: boolean; requireBlockedReason?: boolean },
 ): Promise<IssueRow> {
   const requestedAssignee = await resolveIssueAssignee(
     project.id,
@@ -1186,6 +1180,10 @@ export async function createIssue(
   await assertCycle(project.id, input.cycleId);
   await assertColumn(project.id, input.columnId);
   await assertWipLimit(input.columnId);
+  const blockedReason = input.blockedReason?.trim() || null;
+  const createdBlocked = input.columnId === (await blockedColumnId(project.id));
+  if (createdBlocked && !blockedReason && opts?.requireBlockedReason)
+    throw blockedReasonRequired();
   await assertIssueType(project.id, input.typeId);
   await assertParent(project.id, null, input.parentId);
   assertDateOrder(input.startDate, input.dueDate);
@@ -1231,6 +1229,7 @@ export async function createIssue(
         startDate: input.startDate ?? null,
         dueDate: input.dueDate ?? null,
         position: Number(posRow.pos),
+        blockedReason: createdBlocked ? blockedReason : null,
       })
       .returning({ id: issue.id, createdAt: issue.createdAt });
     return row;
@@ -1340,6 +1339,8 @@ export interface IssuePatch {
   estimateMinutes?: number | null;
   startDate?: string | null;
   dueDate?: string | null;
+  // Why the issue is blocked. Read only when columnId moves it into the blocked column.
+  blockedReason?: string;
 }
 
 // opts.onlyIfColumnId makes the write conditional: it applies only while the
@@ -1351,11 +1352,19 @@ export interface IssuePatch {
 // instead of throwing. Automations set it, because they run after the write that
 // triggered them — a throw there would report a move that already succeeded as
 // failed, and abort the rest of the batch the automation is working through.
+//
+// opts.requireBlockedReason refuses a move into the blocked column without a
+// blockedReason. The routes set it; an automation moves an issue there without one.
 export async function updateIssue(
   id: number,
   patch: IssuePatch,
   actor?: ActivityActor,
-  opts?: { onlyIfColumnId?: number; skipIfColumnFull?: boolean; skipAutoAssignee?: boolean },
+  opts?: {
+    onlyIfColumnId?: number;
+    skipIfColumnFull?: boolean;
+    skipAutoAssignee?: boolean;
+    requireBlockedReason?: boolean;
+  },
 ): Promise<IssueRow | null> {
   const before = await loadSnapshot(id);
   if (!before) return null;
@@ -1386,6 +1395,11 @@ export async function updateIssue(
   }
   await assertIssueType(before.projectId, patch.typeId);
   await assertParent(before.projectId, id, patch.parentId);
+  const blockedReason = patch.blockedReason?.trim() || null;
+  const blockedColumn = movedToColumnId === null ? null : await blockedColumnId(before.projectId);
+  const entersBlocked = movedToColumnId !== null && movedToColumnId === blockedColumn;
+  if (entersBlocked && !blockedReason && opts?.requireBlockedReason)
+    throw blockedReasonRequired();
 
   // Saved actions resolve automatic assignment before checking the confirmed effect.
   const autoAssignee =
@@ -1411,6 +1425,10 @@ export async function updateIssue(
   if (patch.estimateMinutes !== undefined) set.estimateMinutes = patch.estimateMinutes;
   if (patch.startDate !== undefined) set.startDate = patch.startDate;
   if (patch.dueDate !== undefined) set.dueDate = patch.dueDate;
+  if (movedToColumnId !== null) {
+    set.blockedReason = entersBlocked ? blockedReason : null;
+    set.blockedFromColumnId = entersBlocked ? before.columnId : null;
+  }
 
   const changed = Object.keys(set).length > 0;
   if (changed) {
@@ -1447,6 +1465,7 @@ export async function updateIssue(
         await emitIssueEvent('issue.state_changed', after, actor);
         await queueStatusRuns([id], after.columnId, actorId(actor));
         await applySubtaskAutomation(after, actor);
+        await syncBlockedIssues(await blockedTargetIds([id]), actor);
       }
     }
   }
@@ -1486,6 +1505,8 @@ export async function deleteIssue(
   // Read before the delete: the issue.deleted payload is the issue as it last read.
   const deleted = await getIssue(issueId);
   if (!deleted) return null;
+  // The links go with the issue, so the issues it blocks are read first.
+  const blockedIds = await blockedTargetIds([issueId]);
   const attachments = await db.transaction(async (tx) => {
     const attachmentRows = await tx
       .select()
@@ -1497,6 +1518,7 @@ export async function deleteIssue(
   if (!attachments) return null;
   await deleteThreadsWhere({ issueId });
   await emitIssueEvent('issue.deleted', deleted, actorUserId);
+  await syncBlockedIssues(blockedIds, actorUserId);
   return attachments;
 }
 
@@ -1620,6 +1642,12 @@ export async function bulkUpdateIssues(
     await assertColumn(projectId, patch.columnId);
     const incoming = await countEnteringColumn(valid, patch.columnId);
     if (incoming > 0) await assertWipLimit(patch.columnId, incoming);
+    if (
+      incoming > 0 &&
+      !patch.blockedReason?.trim() &&
+      patch.columnId === (await blockedColumnId(projectId))
+    )
+      throw blockedReasonRequired();
   }
   // Same reason as the WIP check: an inactive assignee that only some of the issues
   // already hold would refuse the rest after the first ones were written.
