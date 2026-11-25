@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.13.1](https://github.com/croffasia/itsaplan/compare/v1.13.0...v1.13.1) (2026-11-25)
+
+
+### Improvements
+
+* grant role permissions in order ([#1008](https://github.com/croffasia/itsaplan/issues/1008)) ([909b0ac](https://github.com/croffasia/itsaplan/commit/909b0ac25a2c93447556b90225306b3acdde6b5d))
+
+
+### Bug Fixes
+
+* **web:** let the Docs home scroll on small screens ([#1010](https://github.com/croffasia/itsaplan/issues/1010)) ([5d8d1a4](https://github.com/croffasia/itsaplan/commit/5d8d1a4b97bc4fba7f19642c56792e6b8617c24d))
+
+
+### Documentation
+
+* add a Trusted by row and a list of teams ([#1005](https://github.com/croffasia/itsaplan/issues/1005)) ([93f5bb0](https://github.com/croffasia/itsaplan/commit/93f5bb05b24480c269e139e2f6cd4db6048287e8))
+
 ## [1.13.0](https://github.com/croffasia/itsaplan/compare/v1.12.0...v1.13.0) (2026-11-24)
 
 
